@@ -1,0 +1,330 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Stack 2 - Knowledge Base Application Layer.
+  Creates the OpenSearch vector index, Bedrock Knowledge Base, data source,
+  document processing Lambdas, and S3 buckets.
+  Requires stack-1-aoss.yaml to be deployed first.
+
+Parameters:
+  AossStackName:
+    Type: String
+    Description: Name of the stack-1-aoss stack (used to import exported values)
+
+Outputs:
+  DocumentBucketName:
+    Description: Name of the documents S3 bucket
+    Value: !Ref DocumentBucket
+
+  DocumentParserLambdaArn:
+    Description: ARN of the DocumentParser Lambda function
+    Value: !GetAtt DocumentParserLambda.Arn
+
+  KBParserLambdaArn:
+    Description: ARN of the KBParser Lambda function
+    Value: !GetAtt KBParserLambda.Arn
+
+  KnowledgeBaseId:
+    Description: Bedrock Knowledge Base ID
+    Value: !Ref DocumentKnowledgeBase
+
+  KnowledgeBaseArn:
+    Description: Bedrock Knowledge Base ARN
+    Value: !GetAtt DocumentKnowledgeBase.KnowledgeBaseArn
+
+Resources:
+
+  # -- Lambda: Document parser (Textract -> S3) -------------------------------
+  DocumentParserLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub
+        - '${AWS::StackName}-${StackUUID}-document-parser'
+        - StackUUID: !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      Runtime: python3.14
+      Handler: index.lambda_handler
+      Role: !ImportValue
+        'Fn::Sub': '${AossStackName}-LambdaRoleArn'
+      Timeout: 300
+      MemorySize: 1024
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+
+          def lambda_handler(event, context):
+              print(event)
+              textract = boto3.client("textract")
+              s3 = boto3.client("s3")
+
+              bucket   = event["Records"][0]["s3"]["bucket"]["name"]
+              document = event["Records"][0]["s3"]["object"]["key"]
+
+              response = textract.start_document_analysis(
+                  DocumentLocation={"S3Object": {"Bucket": bucket, "Name": document}},
+                  FeatureTypes=["LAYOUT", "TABLES", "FORMS"],
+              )
+              job_id = response["JobId"]
+
+              while True:
+                  response = textract.get_document_analysis(JobId=job_id)
+                  status   = response["JobStatus"]
+                  if status in ["SUCCEEDED", "FAILED"]:
+                      break
+                  time.sleep(5)
+
+              if status == "SUCCEEDED":
+                  results  = []
+                  pages    = []
+                  response = textract.get_document_analysis(JobId=job_id)
+                  pages.append(response)
+
+                  while "NextToken" in response:
+                      response = textract.get_document_analysis(
+                          JobId=job_id, NextToken=response["NextToken"])
+                      pages.append(response)
+
+                  for page in pages:
+                      for block in page["Blocks"]:
+                          if block["BlockType"] == "LINE":
+                              results.append(block["Text"])
+
+                  output = {"document": document, "extracted_text": results}
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=f"parsed_files/{document.split('/')[-1].split('.')[0]}_parsed.json",
+                      Body=json.dumps(output),
+                  )
+                  return {"statusCode": 200, "body": json.dumps("Document processed successfully")}
+              else:
+                  return {"statusCode": 500, "body": json.dumps("Document processing failed")}
+
+  # -- Lambda: KB parser (S3 JSON -> Bedrock format) -------------------------
+  KBParserLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub
+        - '${AWS::StackName}-${StackUUID}-kb-parser'
+        - StackUUID: !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      Runtime: python3.14
+      Handler: index.lambda_handler
+      Role: !ImportValue
+        'Fn::Sub': '${AossStackName}-LambdaRoleArn'
+      Timeout: 300
+      MemorySize: 1024
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
+          model_id       = "amazon.nova-micro-v1:0"
+          s3_client      = boto3.client("s3")
+
+          def lambda_handler(event, context):
+              print(event)
+              bucket_name = event["Records"][0]["s3"]["bucket"]["name"]
+              object_key  = event["Records"][0]["s3"]["object"]["key"]
+              file_name   = object_key.split("/")[-1]
+
+              response     = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+              file_content = response["Body"].read().decode("utf-8")
+
+              prompt_template = (
+                  f"Analyze the provided document and format it into a structured, "
+                  f"easy-to-read document. Ensure that the document is free from any "
+                  f"errors or inconsistencies. Formatted content should not miss any "
+                  f"information from original document. Finally tag the document with "
+                  f"name {file_name}. Here is the Document: {file_content}"
+              )
+              conversation = [{"role": "user", "content": [{"text": prompt_template}]}]
+
+              try:
+                  response = bedrock_client.converse(
+                      modelId=model_id,
+                      messages=conversation,
+                      inferenceConfig={"maxTokens": 6000, "temperature": 0.5, "topP": 0.9},
+                  )
+                  response_text      = response["output"]["message"]["content"][0]["text"]
+                  output_object_key  = f"parsed_kb_documents/{file_name.split('.')[0]}.txt"
+                  s3_client.put_object(
+                      Bucket=bucket_name, Key=output_object_key, Body=response_text)
+              except (ClientError, Exception) as e:
+                  print(f"ERROR: Can't invoke '{model_id}'. Reason: {e}")
+                  raise
+
+              return {"statusCode": 200, "body": json.dumps("Processing complete")}
+
+  # -- Lambda permissions for S3 trigger ------------------------------------
+  DocumentParserS3Permission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref DocumentParserLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub
+        - 'arn:aws:s3:::documents-${AWS::StackName}-${StackUUID}-${AWS::AccountId}'
+        - StackUUID: !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      SourceAccount: !Ref AWS::AccountId
+
+  KBParserS3Permission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref KBParserLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub
+        - 'arn:aws:s3:::documents-${AWS::StackName}-${StackUUID}-${AWS::AccountId}'
+        - StackUUID: !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      SourceAccount: !Ref AWS::AccountId
+
+  # -- S3: Access logs bucket ------------------------------------------------
+  AccessLogsBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub
+        - 'access-logs-${AWS::StackName}-${StackUUID}-${AWS::AccountId}'
+        - StackUUID: !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      LoggingConfiguration:
+        LogFilePrefix: self-access-logs/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  # -- S3: Documents bucket --------------------------------------------------
+  DocumentBucket:
+    Type: 'AWS::S3::Bucket'
+    DependsOn:
+      - DocumentParserS3Permission
+      - KBParserS3Permission
+    Properties:
+      BucketName: !Sub
+        - 'documents-${AWS::StackName}-${StackUUID}-${AWS::AccountId}'
+        - StackUUID: !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: document-bucket-access-logs/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw_files/
+                  - Name: suffix
+                    Value: .pdf
+            Function: !GetAtt DocumentParserLambda.Arn
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw_files/
+                  - Name: suffix
+                    Value: .png
+            Function: !GetAtt DocumentParserLambda.Arn
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: parsed_files/
+                  - Name: suffix
+                    Value: .json
+            Function: !GetAtt KBParserLambda.Arn
+
+  # -- OpenSearch: Vector index (native CFN - collection exists from Stack 1) -
+  VectorIndex:
+    Type: AWS::OpenSearchServerless::Index
+    Properties:
+      CollectionEndpoint: !ImportValue
+        'Fn::Sub': '${AossStackName}-CollectionEndpoint'
+      IndexName: 'document_index'
+      Settings:
+        Index:
+          Knn: true
+          KnnAlgoParamEfSearch: 512
+      Mappings:
+        Properties:
+          vector_field:
+            Type: knn_vector
+            Dimension: 1536
+            Method:
+              Name: hnsw
+              Engine: faiss
+              SpaceType: l2
+              Parameters:
+                EfConstruction: 512
+                M: 16
+          text_chunk:
+            Type: text
+          metadata:
+            Type: text
+            Index: false
+
+  # -- Bedrock: Knowledge Base -----------------------------------------------
+  DocumentKnowledgeBase:
+    Type: 'AWS::Bedrock::KnowledgeBase'
+    DependsOn: VectorIndex
+    Properties:
+      Name: !Sub
+        - '${AWS::StackName}-${StackUUID}-kb'
+        - StackUUID: !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      Description: 'Knowledge base for document processing'
+      RoleArn: !ImportValue
+        'Fn::Sub': '${AossStackName}-BedrockKBRoleArn'
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v1'
+      StorageConfiguration:
+        Type: OPENSEARCH_SERVERLESS
+        OpensearchServerlessConfiguration:
+          CollectionArn: !ImportValue
+            'Fn::Sub': '${AossStackName}-CollectionArn'
+          VectorIndexName: 'document_index'
+          FieldMapping:
+            VectorField: 'vector_field'
+            TextField:   'text_chunk'
+            MetadataField: 'metadata'
+
+  # -- Bedrock: Data Source --------------------------------------------------
+  DocumentDataSource:
+    Type: 'AWS::Bedrock::DataSource'
+    Properties:
+      Name: !Sub
+        - '${AWS::StackName}-${StackUUID}-datasource'
+        - StackUUID: !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      Description: 'S3 data source for document processing'
+      KnowledgeBaseId: !Ref DocumentKnowledgeBase
+      DataDeletionPolicy: RETAIN
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt DocumentBucket.Arn
+          InclusionPrefixes:
+            - 'parsed_kb_documents/'

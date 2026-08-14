@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Stack 1 - AOSS collection + IAM roles.
+  Must be fully deployed before stack-2-kb.yaml so the collection endpoint
+  exists when the EarlyValidation hook runs on Stack 2.
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # IAM: Lambda execution role
+  # ---------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaS3AossBedrockPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub 'arn:aws:s3:::documents-*-${AWS::AccountId}'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                Resource:
+                  - !Sub 'arn:aws:s3:::documents-*-${AWS::AccountId}/*'
+              - Effect: Allow
+                Action:
+                  - 'aoss:APIAccessAll'
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-micro-v1:0'
+              - Effect: Allow
+                # Textract does not support resource-level ARN scoping;
+                # * is required per AWS documentation.
+                Action:
+                  - 'textract:StartDocumentAnalysis'
+                  - 'textract:GetDocumentAnalysis'
+                Resource: '*'
+
+  # ---------------------------------------------------------------------------
+  # IAM: Bedrock Knowledge Base role
+  # ---------------------------------------------------------------------------
+  BedrockKBRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+      Policies:
+        - PolicyName: BedrockEmbeddingModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock:ListFoundationModels'
+                  - 'bedrock:ListCustomModels'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v1'
+        - PolicyName: BedrockS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub 'arn:aws:s3:::documents-*-${AWS::AccountId}'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                Resource:
+                  - !Sub 'arn:aws:s3:::documents-*-${AWS::AccountId}/*'
+        - PolicyName: BedrockAOSSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'aoss:APIAccessAll'
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+
+  # ---------------------------------------------------------------------------
+  # AOSS: Encryption policy (must exist before collection)
+  # ---------------------------------------------------------------------------
+  EncryptionPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Sub
+        - '${AWS::StackName}-${StackUUID}-enc'
+        - StackUUID: !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      Type: encryption
+      Description: Encryption policy for KB collection
+      Policy: !Sub >-
+        {"Rules":[{"ResourceType":"collection","Resource":["collection/${AWS::StackName}-*"]}],"AWSOwnedKey":true}
+
+  # ---------------------------------------------------------------------------
+  # AOSS: Network policy
+  # ---------------------------------------------------------------------------
+  NetworkPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Sub
+        - '${AWS::StackName}-${StackUUID}-net'
+        - StackUUID: !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      Type: network
+      Description: Network policy for KB collection
+      Policy: !Sub >-
+        [{"Rules":[{"ResourceType":"collection","Resource":["collection/${AWS::StackName}-*"]},{"ResourceType":"dashboard","Resource":["collection/${AWS::StackName}-*"]}],"AllowFromPublic":true}]
+
+  # ---------------------------------------------------------------------------
+  # AOSS: Data access policy
+  # ---------------------------------------------------------------------------
+  DataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub
+        - '${AWS::StackName}-${StackUUID}-dap'
+        - StackUUID: !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      Type: data
+      Description: Data access policy for Lambda, Bedrock KB roles, and deployer
+      Policy: !Sub |-
+        [
+          {
+            "Description": "Access for Lambda and Bedrock KB roles",
+            "Rules": [
+              {
+                "ResourceType": "index",
+                "Resource": ["index/*/*"],
+                "Permission": [
+                  "aoss:CreateIndex","aoss:DeleteIndex","aoss:UpdateIndex",
+                  "aoss:DescribeIndex","aoss:ReadDocument","aoss:WriteDocument"
+                ]
+              },
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/*"],
+                "Permission": [
+                  "aoss:CreateCollectionItems","aoss:DeleteCollectionItems",
+                  "aoss:UpdateCollectionItems","aoss:DescribeCollectionItems"
+                ]
+              }
+            ],
+            "Principal": [
+              "${LambdaExecutionRole.Arn}",
+              "${BedrockKBRole.Arn}",
+              "arn:aws:sts::${AWS::AccountId}:assumed-role/Admin/abhagam-Isengard"
+            ]
+          }
+        ]
+
+  # ---------------------------------------------------------------------------
+  # AOSS: Collection
+  # ---------------------------------------------------------------------------
+  DocumentCollection:
+    Type: 'AWS::OpenSearchServerless::Collection'
+    DependsOn:
+      - EncryptionPolicy
+      - NetworkPolicy
+      - DataAccessPolicy
+    Properties:
+      Name: !Sub
+        - '${AWS::StackName}-${StackUUID}-col'
+        - StackUUID: !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      Type: VECTORSEARCH
+
+# ---------------------------------------------------------------------------
+# Outputs exported for Stack 2
+# ---------------------------------------------------------------------------
+Outputs:
+
+  CollectionArn:
+    Description: AOSS collection ARN
+    Value: !GetAtt DocumentCollection.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CollectionArn'
+
+  CollectionEndpoint:
+    Description: AOSS collection endpoint (used by AWS::OpenSearchServerless::Index)
+    Value: !GetAtt DocumentCollection.CollectionEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-CollectionEndpoint'
+
+  LambdaRoleArn:
+    Description: Lambda execution role ARN
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRoleArn'
+
+  BedrockKBRoleArn:
+    Description: Bedrock KB role ARN
+    Value: !GetAtt BedrockKBRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockKBRoleArn'
