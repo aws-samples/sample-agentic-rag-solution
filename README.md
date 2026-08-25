@@ -1,17 +1,11 @@
-## My Project
+Amazon Bedrock KnowledgeBase Customization
 
-TODO: Fill this README out!
+The solution aims to develop a solution to customize your Bedrock Knowledgebase which allows to support variety of documents and improve accuracy of responses.
+Follow these steps to deploy and use this solution
 
-Be sure to:
+    Clone the respository
+    Now navigate to the custom-knowledgebase folder and run the shell script using the command below. This will deploy the cloud formation into your account.
 
-* Change the title in this README
-* Edit your repository description on GitHub
+"bash custom_kb_deployment_setup.sh"
 
-## Security
-
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
-
-## License
-
-This library is licensed under the MIT-0 License. See the LICENSE file.
-
+This solution will deploy S3 buckets, Lamnda functions, OpenSearch Serverless collection and Bedrock Knowledge base in your account.
