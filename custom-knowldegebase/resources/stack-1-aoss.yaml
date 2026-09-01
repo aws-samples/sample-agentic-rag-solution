@@ -171,8 +171,7 @@ Resources:
             ],
             "Principal": [
               "${LambdaExecutionRole.Arn}",
-              "${BedrockKBRole.Arn}",
-              "arn:aws:sts::${AWS::AccountId}:assumed-role/Admin/abhagam-Isengard"
+              "${BedrockKBRole.Arn}"
             ]
           }
         ]
